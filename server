@@ -1,0 +1,213 @@
+#!bin/bash
+
+#--------------------------------------------------------
+echo '►	ПОДГОТОВКА'
+#--------------------------------------------------------
+
+LANG=ru_RU.utf8 &> /dev/null
+timedatectl set-timezone Asia/Novosibirsk &> /dev/null
+localectl set-locale LANG=ru_RU.UTF-8 &> /dev/null
+localectl set-keymap us ru --no-convert &> /dev/null
+sysctl --write net.ipv6.conf.all.disable_ipv6=1 &> /dev/null
+firewall-cmd --permanent --remove-service="dhcpv6-client" &> /dev/null
+service network restart &> /dev/null
+firewall-cmd --reload &> /dev/null
+
+#--------------------------------------------------------
+echo '►	ВВОД ДАННЫХ'
+#--------------------------------------------------------
+
+read -p "- Файл лога [/mnt/flash/server.log]: " LOG
+LOG=${LOG:-"/mnt/flash/server.log"}
+export LOG && echo "Лог создан: `date`" > $LOG
+read -p "- IP сервера [`hostname -I`]: " IP
+IP=${IP:-`hostname -I`}
+export IP && echo "IP-адрес сервера: $IP"  >> $LOG
+read -p "- Имя пользователя [yaremchuk]: " NAME
+NAME=${NAME:-"yaremchuk"}
+export NAME && echo "Пользователь: $NAME"  >> $LOG
+read -p "- Пароль: " PSWD
+export PSWD
+read -p "- Информационная база: " BASE
+export BASE && echo "Информационная база: $BASE"  >> $LOG
+
+#--------------------------------------------------------
+echo '►	УСТАНОВКА ЗАВИСИМОСТЕЙ' | tee -a $LOG
+#--------------------------------------------------------
+
+echo '• Настройка локального репозитория' | tee -a $LOG
+
+echo '[localrepo]
+name=Repo for Server1C
+baseurl=file:///mnt/flash/localrepo
+gpgcheck=0
+enabled=1' > /etc/yum.repos.d/localrepo.repo
+cat /etc/yum.repos.d/localrepo.repo >> $LOG
+echo "Добавлен репозиторий: `yum repolist | grep Server1C`" &>> $LOG
+
+echo '• Установка зависимостей PostgreSQL' | tee -a $LOG
+
+yum install -y --disablerepo="*" --enablerepo="localrepo" initscripts libicu libicu-devel libxslt &>> $LOG
+
+echo '• Установка зависимостей 1С' | tee -a $LOG
+
+yum install -y --disablerepo="*" --enablerepo="localrepo" ImageMagick &>> $LOG
+yum clean all &>> $LOG
+yum install -y --disablerepo="*" --enablerepo="localrepo" ImageMagick.i686 &>> $LOG
+yum clean all &>> $LOG
+
+echo '• Установка шрифтов Microsoft' | tee -a $LOG
+
+mkdir -p /usr/share/fonts/msttcore 2>> $LOG && chmod --recursive 755 /usr/share/fonts/msttcore 2>> $LOG
+cp /mnt/flash/fonts/* /usr/share/fonts/msttcore 2>> $LOG
+fc-cache --force --system-only 2>> $LOG
+mkfontscale /usr/share/fonts/msttcore 2>> $LOG
+mkfontdir /usr/share/fonts/msttcore 2>> $LOG
+echo 'Установлены шрифты:' >> $LOG && fc-list | grep msttcore &>> $LOG
+
+#--------------------------------------------------------
+echo '►	УСТАНОВКА СЕРВЕРОВ' | tee -a $LOG
+#--------------------------------------------------------
+
+echo '• Установка сервера PostgreSQL (x86_64)' | tee -a $LOG
+
+rpm -Uvh /mnt/flash/postgresql/*.rpm &>> $LOG
+
+echo '• Установка сервера 1С (i386)' | tee -a $LOG
+
+rpm -Uvh /mnt/flash/server1c/*.rpm &>> $LOG
+cp --remove-destination /mnt/flash/server1c/backbas.so /opt/1C/v8.3/i386 2>> $LOG
+chown -R usr1cv8:grp1cv8 /opt/1C /home/usr1cv8 2>> $LOG
+
+echo '• Установка сервера Samba' | tee -a $LOG
+
+yum install -y --disablerepo="*" --enablerepo="localrepo" samba &>> $LOG
+
+echo '• Установка вспомогательных утилит' | tee -a $LOG
+
+yum install -y --disablerepo="*" --enablerepo="localrepo" mc lsof iftop iotop yum-plugin-remove-with-leaves &>> $LOG
+yum clean all &>> $LOG
+
+
+#--------------------------------------------------------
+echo '►	НАСТРОЙКА FIREWALL' | tee -a $LOG
+#--------------------------------------------------------
+
+echo '• Разрешение подключения для Samba' | tee -a $LOG
+
+firewall-cmd --permanent --add-service="samba" &>> $LOG
+
+echo '• Разрешение подключения для PostgreSQL' | tee -a $LOG
+
+firewall-cmd --permanent --add-service="postgresql" &>> $LOG
+
+echo '• Разрешение подключения для 1С' | tee -a $LOG
+
+echo '<?xml version="1.0" encoding="utf-8"?>
+<service>
+<short>server1c</short>
+<description>Server 1C v8.3</description>
+<port protocol="tcp" port="1540"/>
+<port protocol="tcp" port="1541"/>
+<port protocol="tcp" port="1560-1691"/>
+</service>' > /usr/lib/firewalld/services/srv1cv83.xml
+cat /usr/lib/firewalld/services/srv1cv83.xml &>> $LOG
+firewall-cmd --permanent --new-service-from-file="/usr/lib/firewalld/services/srv1cv83.xml" --name="server1c" &>> $LOG
+rm --force /usr/lib/firewalld/services/srv1cv83.xml 2>> $LOG
+firewall-cmd --permanent --add-service="server1c" &>> $LOG
+
+echo '• Применение изменений' | tee -a $LOG
+
+firewall-cmd --reload &>> $LOG
+echo "Активные сервисы: `firewall-cmd --list-services`" &>> $LOG
+
+#--------------------------------------------------------
+echo '►	ЗАПУСК СЕРВЕРОВ' | tee -a $LOG
+#--------------------------------------------------------
+
+export PATH="$PATH:/usr/pgsql-9.6/bin:/opt/1C/v8.3/i386"
+echo 'export PATH="$PATH:/usr/pgsql-9.6/bin:/opt/1C/v8.3/i386"' >> ~/.bashrc
+echo "${IP} `hostname`" >> /etc/hosts
+
+echo '• Создание нового пользователя' | tee -a $LOG
+
+useradd ${NAME} --password ${PSWD} --groups wheel,grp1cv8,postgres 2>> $LOG
+echo "Группы пользователя $NAME: `groups $NAME`" &>> $LOG
+
+echo '• Запуск сервера Samba' | tee -a $LOG
+
+mkdir -p /samba/public 2>> $LOG && chcon --type samba_share_t /samba/public 2>> $LOG
+chown --recursive nobody:nobody /samba/public 2>> $LOG && chmod --recursive 777 /samba/public 2>> $LOG
+mkdir -p /samba/private 2>> $LOG && chcon --type samba_share_t /samba/private 2>> $LOG
+chown --recursive ${NAME} /samba/private 2>> $LOG && chmod --recursive 700 /samba/private 2>> $LOG
+cp /etc/samba/smb.conf /etc/samba/smb.conf.bak 2>> $LOG
+echo "[global]
+security = user
+map to guest = bad user
+guest account = nobody
+[public]
+path = /samba/public
+browsable = yes
+writable = yes
+guest ok = yes
+[private]
+path = /samba/private
+browsable = no
+writable = yes
+guest ok = no
+valid users = $NAME" > /etc/samba/smb.conf
+(echo ${PSWD}; echo ${PSWD}) | smbpasswd -s -a ${NAME} &>> $LOG
+testparm --suppress-prompt &>> $LOG
+systemctl start smb nmb &>> $LOG
+systemctl enable smb nmb &>> $LOG
+
+echo '• Запуск сервера PostgreSQL' | tee -a $LOG
+
+export PGDATA="/var/lib/pgsql/9.6/data"
+su postgres -c "initdb --locale=ru_RU.UTF-8" &>> $LOG
+systemctl start postgresql-9.6 &>> $LOG
+systemctl enable postgresql-9.6 &>> $LOG
+su postgres -c "psql -c \"ALTER ROLE postgres WITH PASSWORD 'postgres';\"" &>> $LOG
+su postgres -c "psql -c \"CREATE ROLE $NAME WITH LOGIN SUPERUSER CREATEROLE CREATEDB REPLICATION BYPASSRLS PASSWORD '$PSWD';\"" &>> $LOG
+echo 'Пользователи PostgreSQL:' >> $LOG && su postgres -c "psql -c \"\du\"" &>> $LOG
+
+echo '• Запуск сервера 1С' | tee -a $LOG
+
+systemctl start srv1cv83 &>> $LOG
+systemctl enable srv1cv83 &>> $LOG
+ras --daemon cluster &>> $LOG
+CLUSTER=$(rac cluster list | grep cluster | tail -c 37)
+rac cluster admin --cluster=$CLUSTER register --name=${NAME} --pwd=${PSWD} --auth=pwd,os --os-user=${NAME} &>> $LOG
+echo 'Администраторы кластера:' >> $LOG && rac cluster admin --cluster=$CLUSTER list --cluster-user=$NAME --cluster-pwd=$PSWD >> $LOG
+rac agent admin register --name=${NAME} --pwd=${PSWD} --auth=pwd,os --os-user=${NAME} &>> $LOG
+echo 'Администраторы агента:' >> $LOG && rac agent admin list --agent-user=$NAME --agent-pwd=$PSWD >> $LOG
+rac infobase create --cluster=$CLUSTER  --cluster-user=${NAME} --cluster-pwd=${PSWD} --name=${BASE} --create-database --dbms=PostgreSQL \
+--db-server=${IP} --db-name=db_${BASE} --locale=ru --db-user=postgres --db-pwd=postgres --license-distribution=allow &>> $LOG
+
+echo '• Настройка бэкапа и обслуживания' | tee -a $LOG
+
+echo "export PGPASSWORD='postgres'
+su ${NAME} -c \"pg_dump --username=postgres db_${BASE} | gzip > /samba/private/db_${BASE}.\`date +'%Y-%m-%d-%H-%M-%S'\`.gz\"
+find /samba/private -type f -mtime +3 -exec rm -rf {} \;" > /etc/cron.daily/backup
+echo "Ежедневно:" >> $LOG && cat /etc/cron.daily/backup &>> $LOG
+chmod 700 /etc/cron.daily/backup 2>> $LOG
+echo "export PGPASSWORD='postgres'
+vacuumdb --quiet --full --analyze --username=postgres --dbname=db_${BASE}
+reindexdb --quiet --username=postgres --dbname=db_${BASE}" > /etc/cron.weekly/maintaince
+echo "Еженедельно:" >> $LOG && cat /etc/cron.weekly/maintaince &>> $LOG
+chmod 700 /etc/cron.weekly/maintaince 2>> $LOG
+echo "0 3 * * * root run-parts /etc/cron.daily
+0 3 * * 0 root run-parts /etc/cron.weekly" >> /etc/crontab
+echo "Расписание:" >> $LOG && cat /etc/crontab &>> $LOG
+
+#--------------------------------------------------------
+echo '►	РЕЗУЛЬТАТ' | tee -a $LOG
+#--------------------------------------------------------
+
+echo "Сетевой ресурс для всех и без пароля: \\\\$IP\\public" | tee -a $LOG
+echo "Скрытый сетевой ресурс для $NAME с паролем $PSWD: \\\\$IP\\private" | tee -a $LOG
+echo "Ежедневно в 03:00 (хранится 3 дня) бэкап в приватный ресурс, по воскресеньям в 03:00 обслуживание БД." | tee -a $LOG
+echo "Использовать для доступа к информационной базе строку: Srvr=”$IP”; Ref=”$BASE”" | tee -a $LOG
+echo "Клиенты 1С для Windows в каталоге: /mnt/flash/client1c" | tee -a $LOG
+
+exit 0
